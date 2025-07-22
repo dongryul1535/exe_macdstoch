@@ -2,8 +2,8 @@ name: dart-macd-stoch-bot
 
 on:
   schedule:
-    # 매일 09:05 KST (= 00:05 UTC)에 실행
-    - cron: '5 0 * * *'
+    # 매일 15:00 KST (= 06:00 UTC)에 실행
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 jobs:
