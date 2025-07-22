@@ -58,6 +58,8 @@ DART_KEY = os.getenv("DART_API_KEY")
 SCALE_MACD = os.getenv("SCALE_MACD", "false").lower() == "true"
 SAVE_CSV   = os.getenv("SAVE_CSV",   "false").lower() == "true"
 FONT_PATH  = os.getenv("FONT_PATH", "")
+# ▶ 테스트용 날짜 보정: 0=오늘, 1=어제, 2=그제 …
+DART_OFFSET_DAYS = int(os.getenv("DART_OFFSET_DAYS", "0"))
 
 if not (TOKEN and CHAT_ID and DART_KEY):
     raise SystemExit("필수 환경변수 누락: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DART_API_KEY")
@@ -115,10 +117,14 @@ TARGET_KEYWORDS = ["임원", "주요주주", "특정증권등소유상황보고�
 EXCLUDE_KEYWORDS = ["정정", "변경", "취소", "신규선임", "해임", "사임", "퇴임", "임원현황", "의결권"]
 
 
-def fetch_today_list() -> List[dict]:
-    """오늘자 공시 목록 (다중 페이지)"""
-    bgn_de = TODAY
-    end_de = TODAY
+def ymd(days_offset: int = 0) -> str:
+    return (dt.datetime.now(KST) - dt.timedelta(days=days_offset)).strftime('%Y%m%d')
+
+
+def fetch_list(days_offset: int = 0) -> List[dict]:
+    """특정 날짜(오프셋) 공시 목록 (다중 페이지)"""
+    bgn_de = ymd(days_offset)
+    end_de = bgn_de
     all_rows: List[dict] = []
     for page in range(1, 11):
         params = {
@@ -141,7 +147,7 @@ def fetch_today_list() -> List[dict]:
         if len(rows) < 100:
             break
         time.sleep(0.3)
-    logging.info("오늘 공시 %d건 수집", len(all_rows))
+    logging.info("%s 공시 %d건 수집", bgn_de, len(all_rows))
     return all_rows
 
 
@@ -254,12 +260,12 @@ def main():
     logging.info("==== 시작: %s ====" , dt.datetime.now(KST))
 
     corp_map = load_corp_map()  # stock_code → corp_code/name
-    rows = fetch_today_list()
+    rows = fetch_list(DART_OFFSET_DAYS)
     targets = filter_target_disclosures(rows)
 
     if not targets:
         logging.info("타깃 공시 없음")
-        tg_text("오늘 임원·주요주주 특정증권등소유상황보고서 공시 없음")
+        tg_text(f"{ymd(DART_OFFSET_DAYS)} 임원·주요주주 특정증권등소유상황보고서 공시 없음")
         return
 
     alerts: List[str] = []
