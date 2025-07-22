@@ -1,0 +1,8 @@
+pandas>=2.0
+requests>=2.31
+FinanceDataReader>=0.9.93
+matplotlib>=3.8
+ ta>=0.11.0
+# (optional) for krx listing cache speedups
+lxml>=4.9
+python-dateutil>=2.9
