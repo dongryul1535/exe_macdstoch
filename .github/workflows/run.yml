@@ -5,6 +5,11 @@ on:
     # 매일 15:00 KST (= 06:00 UTC)에 실행
     - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      dart_offset_days:
+        description: '테스트용 날짜 오프셋 (0=오늘, 1=어제)'
+        required: false
+        default: '0'
 
 jobs:
   run-bot:
@@ -42,5 +47,6 @@ jobs:
           DART_API_KEY:       ${{ secrets.DART_API_KEY }}
           SCALE_MACD:         true
           SAVE_CSV:           false
+          DART_OFFSET_DAYS:   ${{ github.event.inputs.dart_offset_days || 0 }}
         run: |
           python main.py
