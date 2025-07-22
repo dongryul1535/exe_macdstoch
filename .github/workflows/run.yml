@@ -48,5 +48,6 @@ jobs:
           SCALE_MACD:         true
           SAVE_CSV:           false
           DART_OFFSET_DAYS:   ${{ github.event.inputs.dart_offset_days || 0 }}
+          FONT_PATH: fonts/NanumGothic.ttf
         run: |
           python main.py
