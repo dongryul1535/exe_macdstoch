@@ -8,3 +8,4 @@ python-dateutil>=2.9
 finance-datareader>=0.9.92
 # (옵션) 백업 데이터 소스로 사용할 경우
 pykrx>=1.0.48
+numpy>=1.24.0
