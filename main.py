@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-DART 임원·주요주주 특정증권등소유상황보고서 + MACD/Stoch 교차 신호 알림 봇
+DART 임원·주요주주 특정증권등소유상황보고서 + NH MTS-style MACD+Stochastic 알림 봇
 ────────────────────────────────────────────────────────────────────
 1) 오늘(한국시간) 공시된 "임원·주요주주특정증권등소유상황보고서"만 필터링
-2) 해당 기업의 종목코드 → FinanceDataReader(FDR)로 가격 조회
-3) Composite K / D 계산
-   - Composite K = MACD(12,26) + Slow %K(14,3)
-   - Composite D = MACD Signal(9) + Slow %D(14,3)
-4) 골든/데드 크로스 탐지 → 텔레그램으로 텍스트 + 차트 이미지 전송
-5) GitHub Actions에서 주기 실행 (requirements.txt, workflow 포함)
+2) 해당 기업 종목코드로 가격 조회 (FinanceDataReader → yfinance fallback 可 추가 가능)
+3) **NH 나무 MTS 방식 Composite K / D 계산**
+   - MACD_raw = EMA(12) - EMA(26)
+   - MACD_norm = 14기간 스토캐스틱(0~100)화 후 3기간 스무딩
+   - Slow%K   = 가격기반 Stochastic(14,3)
+   - Composite K = (MACD_norm + Slow%K) / 2
+   - Composite D = SMA(Composite K, 3)
+4) 골든/데드 크로스 탐지 → 텔레그램 텍스트 + 차트 이미지 전송
+5) GitHub Actions에서 주기 실행
 
-환경 변수
----------
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (필수)
-- DART_API_KEY (필수)
-- SCALE_MACD=true  → MACD 계열 0~100 정규화(선택)
-- SAVE_CSV=true    → CSV 저장(선택)
-- FONT_PATH=/path/to/NanumGothic.ttf  → 한글 폰트 지정(선택)
+ENV
+----
+- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DART_API_KEY (필수)
+- DART_OFFSET_DAYS: 0=오늘, 1=어제 ... (기본 0)
+- SAVE_CSV=true  → CSV 저장
+- FONT_PATH=fonts/NanumGothic.ttf  → 한글 폰트
 
-파일 구성 예시
---------------
-- main.py                 ← 본 스크립트
-- requirements.txt        ← 의존성
-- .github/workflows/run.yml
-
+requirements.txt (예시)
+-----------------------
+numpy>=1.24.0
+pandas>=1.5.3
+requests>=2.28.2
+finance-datareader>=0.9.59
+yfinance>=0.2.40
+matplotlib>=3.8.4
 """
 
 import os
@@ -35,12 +39,10 @@ from typing import List, Optional, Dict
 import time
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pandas as pd
 import requests
 import FinanceDataReader as fdr
-
-from ta.trend import MACD
-from ta.momentum import StochasticOscillator
 
 import matplotlib
 matplotlib.use("Agg")
@@ -55,16 +57,13 @@ TODAY = dt.datetime.now(KST).strftime('%Y%m%d')
 TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 DART_KEY = os.getenv("DART_API_KEY")
-SCALE_MACD = os.getenv("SCALE_MACD", "false").lower() == "true"
-SAVE_CSV   = os.getenv("SAVE_CSV",   "false").lower() == "true"
+SAVE_CSV = os.getenv("SAVE_CSV",   "false").lower() == "true"
 FONT_PATH  = os.getenv("FONT_PATH", "")
-# ▶ 테스트용 날짜 보정: 0=오늘, 1=어제, 2=그제 …
 DART_OFFSET_DAYS = int(os.getenv("DART_OFFSET_DAYS", "0"))
 
 if not (TOKEN and CHAT_ID and DART_KEY):
     raise SystemExit("필수 환경변수 누락: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DART_API_KEY")
 
-# logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Font
@@ -116,10 +115,8 @@ def get_name(code: str) -> str:
 TARGET_KEYWORDS = ["임원", "주요주주", "특정증권등소유상황보고서"]
 EXCLUDE_KEYWORDS = ["정정", "변경", "취소", "신규선임", "해임", "사임", "퇴임", "임원현황", "의결권"]
 
-
 def ymd(days_offset: int = 0) -> str:
     return (dt.datetime.now(KST) - dt.timedelta(days=days_offset)).strftime('%Y%m%d')
-
 
 def fetch_list(days_offset: int = 0) -> List[dict]:
     """특정 날짜(오프셋) 공시 목록 (다중 페이지)"""
@@ -150,15 +147,13 @@ def fetch_list(days_offset: int = 0) -> List[dict]:
     logging.info("%s 공시 %d건 수집", bgn_de, len(all_rows))
     return all_rows
 
-
 def is_target_report(report_nm: str) -> bool:
-    name = (report_nm or "").replace('·', 'ㆍ')  # dot normalization
+    name = (report_nm or "").replace('·', 'ㆍ')
     if not all(k in name for k in TARGET_KEYWORDS):
         return False
     if any(k in name for k in EXCLUDE_KEYWORDS):
         return False
     return True
-
 
 def filter_target_disclosures(rows: List[dict]) -> List[dict]:
     results = []
@@ -169,50 +164,83 @@ def filter_target_disclosures(rows: List[dict]) -> List[dict]:
     return results
 
 # ─────────────────── 시세/지표 계산 ─────────────────── #
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
 def fetch_daily(symbol: str, days: int = 180) -> Optional[pd.DataFrame]:
     end = dt.datetime.now()
     start = end - dt.timedelta(days=days)
+    # 우선 FDR
     try:
         df = fdr.DataReader(symbol, start, end)
-        if df.empty:
-            return None
-        df = df.reset_index()
-        df.rename(columns=str.capitalize, inplace=True)
-        return df[['Date','Open','High','Low','Close','Volume']]
-    except Exception as e:
-        logging.warning("%s 데이터 조회 실패: %s", symbol, e)
-        return None
+        if not df.empty:
+            df = df.reset_index()
+            df.rename(columns=str.capitalize, inplace=True)
+            return df[['Date','Open','High','Low','Close','Volume']]
+    except Exception:
+        pass
+    # yfinance fallback
+    if yf is not None:
+        try:
+            ydf = yf.download(f"{symbol}.KS", start=start.date(), end=end.date(), progress=False)
+            if not ydf.empty:
+                ydf = ydf.rename(columns=str.title).reset_index()
+                return ydf[['Date','Open','High','Low','Close','Volume']]
+        except Exception:
+            pass
+    return None
 
+# NH 스타일 Composite
 
-def add_composites(df: pd.DataFrame) -> pd.DataFrame:
-    macd = MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
-    st   = StochasticOscillator(df['Close'], df['High'], df['Low'], window=14, smooth_window=3)
-    df['MACD']     = macd.macd()
-    df['MACD_SIG'] = macd.macd_signal()
-    df['SlowK']    = st.stoch()
-    df['SlowD']    = st.stoch_signal()
+def add_composites(df: pd.DataFrame,
+                   fast: int = 12, slow: int = 26,
+                   k_window: int = 14, k_smooth: int = 3,
+                   d_smooth: int = 3, use_ema: bool = True,
+                   clip: bool = True) -> pd.DataFrame:
+    close, high, low = df['Close'], df['High'], df['Low']
 
-    m  = df['MACD']
-    ms = df['MACD_SIG']
-    if SCALE_MACD:
-        m  = (m  - m.min())  / (m.max()  - m.min())  * 100
-        ms = (ms - ms.min()) / (ms.max() - ms.min()) * 100
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_raw = ema_fast - ema_slow
 
-    df['CompK'] = m  + df['SlowK']
-    df['CompD'] = ms + df['SlowD']
-    df['Diff']  = df['CompK'] - df['CompD']
+    macd_min = macd_raw.rolling(k_window, min_periods=1).min()
+    macd_max = macd_raw.rolling(k_window, min_periods=1).max()
+    macd_norm = (macd_raw - macd_min) / (macd_max - macd_min).replace(0, np.nan) * 100
+    macd_norm = macd_norm.fillna(50)
+    if k_smooth > 1:
+        macd_norm = macd_norm.ewm(span=k_smooth, adjust=False).mean() if use_ema \
+            else macd_norm.rolling(k_smooth, min_periods=1).mean()
+
+    ll = low.rolling(k_window, min_periods=1).min()
+    hh = high.rolling(k_window, min_periods=1).max()
+    k_raw = (close - ll) / (hh - ll).replace(0, np.nan) * 100
+    k_raw = k_raw.fillna(50)
+    slow_k = (k_raw.ewm(span=k_smooth, adjust=False).mean() if (k_smooth > 1 and use_ema)
+              else k_raw.rolling(k_smooth, min_periods=1).mean() if k_smooth > 1 else k_raw)
+
+    comp_k = (macd_norm + slow_k) / 2.0
+    comp_d = comp_k.rolling(d_smooth, min_periods=1).mean() if d_smooth > 1 else comp_k
+
+    if clip:
+        comp_k = comp_k.clip(0, 100)
+        comp_d = comp_d.clip(0, 100)
+
+    df['CompK'] = comp_k
+    df['CompD'] = comp_d
+    df['Diff']  = comp_k - comp_d
     return df
 
-
-def detect_cross(df: pd.DataFrame) -> Optional[str]:
+def detect_cross(df: pd.DataFrame, ob: int = 80, os: int = 20) -> Optional[str]:
     if len(df) < 2:
         return None
     prev, curr = df['Diff'].iloc[-2], df['Diff'].iloc[-1]
+    prev_k = df['CompK'].iloc[-2]
     if prev <= 0 < curr:
-        return 'BUY'
+        return 'BUY' if prev_k < os else 'BUY_W'
     if prev >= 0 > curr:
-        return 'SELL'
+        return 'SELL' if prev_k > ob else 'SELL_W'
     return None
 
 # ─────────────────── 시각화 ─────────────────── #
@@ -225,10 +253,12 @@ def make_chart(df: pd.DataFrame, code: str) -> str:
     ax1.set_title(f"{code} ({name})", fontproperties=font_prop)
     ax1.legend(prop=font_prop)
 
-    ax2.plot(df['Date'], df['CompK'], label='CompK')
-    ax2.plot(df['Date'], df['CompD'], label='CompD')
-    ax2.axhline(0, color='gray', linewidth=0.7)
-    ax2.set_title('Composite Cross', fontproperties=font_prop)
+    ax2.plot(df['Date'], df['CompK'], color='red', label='MACD+Slow%K')
+    ax2.plot(df['Date'], df['CompD'], color='purple', label='MACD+Slow%D')
+    ax2.axhline(20, color='gray', linestyle='--', linewidth=0.5)
+    ax2.axhline(80, color='gray', linestyle='--', linewidth=0.5)
+    ax2.set_ylim(0, 100)
+    ax2.set_title('MACD+Stochastic (NH Style)', fontproperties=font_prop)
     ax2.legend(prop=font_prop)
     ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))
 
@@ -244,22 +274,27 @@ def make_chart(df: pd.DataFrame, code: str) -> str:
 def tg_text(msg: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     for chunk in [msg[i:i+3500] for i in range(0, len(msg), 3500)]:
-        requests.post(url, json={'chat_id': CHAT_ID, 'text': chunk})
+        try:
+            requests.post(url, json={'chat_id': CHAT_ID, 'text': chunk}, timeout=15)
+        except Exception as e:
+            logging.warning("텍스트 전송 실패: %s", e)
         time.sleep(0.3)
-
 
 def tg_photo(path: str, caption: str = ''):
     url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-    with open(path, 'rb') as f:
-        requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption}, files={'photo': f})
+    try:
+        with open(path, 'rb') as f:
+            requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption}, files={'photo': f}, timeout=30)
+    except Exception as e:
+        logging.warning("사진 전송 실패: %s", e)
     time.sleep(0.3)
 
 # ─────────────────── 메인 ─────────────────── #
 
 def main():
-    logging.info("==== 시작: %s ====" , dt.datetime.now(KST))
+    logging.info("==== 시작: %s ====", dt.datetime.now(KST))
 
-    corp_map = load_corp_map()  # stock_code → corp_code/name
+    corp_map = load_corp_map()
     rows = fetch_list(DART_OFFSET_DAYS)
     targets = filter_target_disclosures(rows)
 
@@ -287,14 +322,14 @@ def main():
             logging.warning("%s(%s) stock_code 없음", corp_name, corp_code)
             continue
 
-        # .KS / .KQ 판별
-        suffix = '.KS' if stock_code in NAME_MAP and NAME_MAP.get(f"{stock_code}.KS") else '.KQ'
+        suffix = '.KS' if f"{stock_code}.KS" in NAME_MAP else '.KQ'
         code = f"{stock_code}{suffix}"
 
         df = fetch_daily(stock_code)
         if df is None or len(df) < 40:
             logging.warning("%s 데이터 부족", code)
             continue
+
         df = add_composites(df)
         sig = detect_cross(df)
 
@@ -316,7 +351,7 @@ def main():
     else:
         tg_text("신호 없음 (골든/데드 크로스 미발생)")
 
-    logging.info("==== 종료 ====\n")
+    logging.info("==== 종료 ====")
 
 
 if __name__ == '__main__':
