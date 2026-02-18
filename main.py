@@ -2,32 +2,9 @@
 """
 DART 임원·주요주주 특정증권등소유상황보고서 + NH MTS-style MACD+Stochastic 알림 봇
 ────────────────────────────────────────────────────────────────────
-1) 오늘(한국시간) 공시된 "임원·주요주주특정증권등소유상황보고서"만 필터링
-2) 해당 기업 종목코드로 가격 조회 (FinanceDataReader → yfinance fallback 可 추가 가능)
-3) **NH 나무 MTS 방식 Composite K / D 계산**
-   - MACD_raw = EMA(12) - EMA(26)
-   - MACD_norm = 14기간 스토캐스틱(0~100)화 후 3기간 스무딩
-   - Slow%K   = 가격기반 Stochastic(14,3)
-   - Composite K = (MACD_norm + Slow%K) / 2
-   - Composite D = SMA(Composite K, 3)
-4) 골든/데드 크로스 탐지 → 텔레그램 텍스트 + 차트 이미지 전송
-5) GitHub Actions에서 주기 실행
-
-ENV
-----
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DART_API_KEY (필수)
-- DART_OFFSET_DAYS: 0=오늘, 1=어제 ... (기본 0)
-- SAVE_CSV=true  → CSV 저장
-- FONT_PATH=fonts/NanumGothic.ttf  → 한글 폰트
-
-requirements.txt (예시)
------------------------
-numpy>=1.24.0
-pandas>=1.5.3
-requests>=2.28.2
-finance-datareader>=0.9.59
-yfinance>=0.2.40
-matplotlib>=3.8.4
+■ 차트: 1열×4행 (일봉 80일 캔들 → 일봉 지표 → 주봉 40주 캔들 → 주봉 지표)
+■ NH MTS: 단기12/장기26/K1=14/K2=3/D=3/기준선 20·80
+■ 양봉 빨강, 음봉 파랑 / MACD+Slow%K 빨강, MACD+Slow%D 보라
 """
 
 import os
@@ -47,7 +24,9 @@ import FinanceDataReader as fdr
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.dates import DateFormatter
+from matplotlib.patches import Rectangle
 import matplotlib.font_manager as fm
 
 # ───────────────────────── 기본 설정 ───────────────────────── #
@@ -57,8 +36,8 @@ TODAY = dt.datetime.now(KST).strftime('%Y%m%d')
 TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 DART_KEY = os.getenv("DART_API_KEY")
-SAVE_CSV = os.getenv("SAVE_CSV",   "false").lower() == "true"
-FONT_PATH  = os.getenv("FONT_PATH", "")
+SAVE_CSV = os.getenv("SAVE_CSV", "false").lower() == "true"
+FONT_PATH = os.getenv("FONT_PATH", "")
 DART_OFFSET_DAYS = int(os.getenv("DART_OFFSET_DAYS", "0"))
 
 if not (TOKEN and CHAT_ID and DART_KEY):
@@ -73,16 +52,30 @@ if FONT_PATH and os.path.exists(FONT_PATH):
     plt.rcParams['font.family'] = font_prop.get_name()
     plt.rcParams['axes.unicode_minus'] = False
 else:
+    plt.rcParams['axes.unicode_minus'] = False
     font_prop = None
+
+# ───── NH MTS 설정값 ─────
+FAST_PERIOD = 12
+SLOW_PERIOD = 26
+K_WINDOW    = 14
+K_SMOOTH    = 3
+D_SMOOTH    = 3
+OB_LINE     = 80
+OS_LINE     = 20
+DAILY_BARS  = 80
+WEEKLY_BARS = 40
+
+COLOR_K = "#FF0000"
+COLOR_D = "#9900FF"
 
 # ─────────────────── DART / KRX 유틸 ─────────────────── #
 DART_URL = "https://opendart.fss.or.kr/api"
 CORP_CODE_URL = f"{DART_URL}/corpCode.xml"
 
-_cache_corp_map: Optional[Dict[str, Dict[str,str]]] = None
+_cache_corp_map: Optional[Dict[str, Dict[str, str]]] = None
 
 def load_corp_map() -> Dict[str, Dict[str, str]]:
-    """{stock_code: {corp_code, corp_name}} 매핑 생성"""
     global _cache_corp_map
     if _cache_corp_map is not None:
         return _cache_corp_map
@@ -102,9 +95,8 @@ def load_corp_map() -> Dict[str, Dict[str, str]]:
     _cache_corp_map = mapping
     return mapping
 
-# 이름 매핑 (KRX,KOSDAQ)
-_krx = fdr.StockListing('KRX')[['Code','Name']]
-_kq  = fdr.StockListing('KOSDAQ')[['Code','Name']]
+_krx = fdr.StockListing('KRX')[['Code', 'Name']]
+_kq  = fdr.StockListing('KOSDAQ')[['Code', 'Name']]
 NAME_MAP = {f"{r.Code}.KS": r.Name for _, r in _krx.iterrows()}
 NAME_MAP.update({f"{r.Code}.KQ": r.Name for _, r in _kq.iterrows()})
 
@@ -119,7 +111,6 @@ def ymd(days_offset: int = 0) -> str:
     return (dt.datetime.now(KST) - dt.timedelta(days=days_offset)).strftime('%Y%m%d')
 
 def fetch_list(days_offset: int = 0) -> List[dict]:
-    """특정 날짜(오프셋) 공시 목록 (다중 페이지)"""
     bgn_de = ymd(days_offset)
     end_de = bgn_de
     all_rows: List[dict] = []
@@ -163,43 +154,59 @@ def filter_target_disclosures(rows: List[dict]) -> List[dict]:
     logging.info("타깃 공시 %d건", len(results))
     return results
 
-# ─────────────────── 시세/지표 계산 ─────────────────── #
+# ─────────────────── 시세 조회 ─────────────────── #
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-def fetch_daily(symbol: str, days: int = 180) -> Optional[pd.DataFrame]:
+def fetch_daily(symbol: str, days: int = 500) -> Optional[pd.DataFrame]:
+    """주봉 40주 + 지표 워밍업 위해 약 500일치"""
     end = dt.datetime.now()
     start = end - dt.timedelta(days=days)
-    # 우선 FDR
     try:
         df = fdr.DataReader(symbol, start, end)
         if not df.empty:
             df = df.reset_index()
             df.rename(columns=str.capitalize, inplace=True)
-            return df[['Date','Open','High','Low','Close','Volume']]
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.sort_values('Date').reset_index(drop=True)
+            return df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
     except Exception:
         pass
-    # yfinance fallback
     if yf is not None:
         try:
             ydf = yf.download(f"{symbol}.KS", start=start.date(), end=end.date(), progress=False)
             if not ydf.empty:
                 ydf = ydf.rename(columns=str.title).reset_index()
-                return ydf[['Date','Open','High','Low','Close','Volume']]
+                ydf['Date'] = pd.to_datetime(ydf['Date'])
+                return ydf[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
         except Exception:
             pass
     return None
 
-# NH 스타일 Composite
+# ─────────────────── 주봉 리샘플링 ─────────────────── #
+def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp['Date'] = pd.to_datetime(tmp['Date'])
+    tmp = tmp.set_index('Date')
+    weekly = tmp.resample('W-FRI').agg({
+        'Open':   'first',
+        'High':   'max',
+        'Low':    'min',
+        'Close':  'last',
+        'Volume': 'sum',
+    }).dropna(subset=['Close'])
+    return weekly.reset_index()
 
+# ─────────────────── NH 스타일 Composite ─────────────────── #
 def add_composites(df: pd.DataFrame,
-                   fast: int = 12, slow: int = 26,
-                   k_window: int = 14, k_smooth: int = 3,
-                   d_smooth: int = 3, use_ema: bool = True,
-                   clip: bool = True) -> pd.DataFrame:
-    close, high, low = df['Close'], df['High'], df['Low']
+                   fast=FAST_PERIOD, slow=SLOW_PERIOD,
+                   k_window=K_WINDOW, k_smooth=K_SMOOTH,
+                   d_smooth=D_SMOOTH) -> pd.DataFrame:
+    close = df['Close'].astype(float)
+    high  = df['High'].astype(float)
+    low   = df['Low'].astype(float)
 
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
@@ -207,73 +214,176 @@ def add_composites(df: pd.DataFrame,
 
     macd_min = macd_raw.rolling(k_window, min_periods=1).min()
     macd_max = macd_raw.rolling(k_window, min_periods=1).max()
-    macd_norm = (macd_raw - macd_min) / (macd_max - macd_min).replace(0, np.nan) * 100
-    macd_norm = macd_norm.fillna(50)
+    denom = (macd_max - macd_min).replace(0, np.nan)
+    macd_norm = ((macd_raw - macd_min) / denom * 100).fillna(50)
     if k_smooth > 1:
-        macd_norm = macd_norm.ewm(span=k_smooth, adjust=False).mean() if use_ema \
-            else macd_norm.rolling(k_smooth, min_periods=1).mean()
+        macd_norm = macd_norm.ewm(span=k_smooth, adjust=False).mean()
 
     ll = low.rolling(k_window, min_periods=1).min()
     hh = high.rolling(k_window, min_periods=1).max()
-    k_raw = (close - ll) / (hh - ll).replace(0, np.nan) * 100
-    k_raw = k_raw.fillna(50)
-    slow_k = (k_raw.ewm(span=k_smooth, adjust=False).mean() if (k_smooth > 1 and use_ema)
-              else k_raw.rolling(k_smooth, min_periods=1).mean() if k_smooth > 1 else k_raw)
+    stoch_denom = (hh - ll).replace(0, np.nan)
+    k_raw = ((close - ll) / stoch_denom * 100).fillna(50)
+    slow_k = k_raw.ewm(span=k_smooth, adjust=False).mean() if k_smooth > 1 else k_raw
 
-    comp_k = (macd_norm + slow_k) / 2.0
-    comp_d = comp_k.rolling(d_smooth, min_periods=1).mean() if d_smooth > 1 else comp_k
+    comp_k = ((macd_norm + slow_k) / 2.0).clip(0, 100)
+    comp_d = comp_k.rolling(d_smooth, min_periods=1).mean().clip(0, 100)
 
-    if clip:
-        comp_k = comp_k.clip(0, 100)
-        comp_d = comp_d.clip(0, 100)
-
+    df = df.copy()
     df['CompK'] = comp_k
     df['CompD'] = comp_d
     df['Diff']  = comp_k - comp_d
     return df
 
-def detect_cross(df: pd.DataFrame, ob: int = 80, os: int = 20) -> Optional[str]:
+def detect_cross(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2:
         return None
     prev, curr = df['Diff'].iloc[-2], df['Diff'].iloc[-1]
     prev_k = df['CompK'].iloc[-2]
     if prev <= 0 < curr:
-        return 'BUY' if prev_k < os else 'BUY_W'
+        return 'BUY' if prev_k < OS_LINE else 'BUY_W'
     if prev >= 0 > curr:
-        return 'SELL' if prev_k > ob else 'SELL_W'
+        return 'SELL' if prev_k > OB_LINE else 'SELL_W'
     return None
 
-# ─────────────────── 시각화 ─────────────────── #
+# ─────────────────── 캔들스틱 ─────────────────── #
+def draw_candlestick(ax, df, width_ratio=0.6):
+    dates = mdates.date2num(pd.to_datetime(df['Date']))
+    if len(dates) >= 2:
+        avg_gap = np.median(np.diff(dates))
+    else:
+        avg_gap = 1.0
+    bar_width = avg_gap * width_ratio
 
-def make_chart(df: pd.DataFrame, code: str) -> str:
-    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(9,6), sharex=True, gridspec_kw={'height_ratios':[3,1]})
+    opens  = df['Open'].values.astype(float)
+    highs  = df['High'].values.astype(float)
+    lows   = df['Low'].values.astype(float)
+    closes = df['Close'].values.astype(float)
+
+    for i in range(len(dates)):
+        d = dates[i]
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+
+        if c >= o:
+            color = '#FF3232'
+            body_bottom = o
+            body_height = c - o
+        else:
+            color = '#3232FF'
+            body_bottom = c
+            body_height = o - c
+
+        ax.plot([d, d], [l, h], color=color, linewidth=0.7, solid_capstyle='round')
+
+        if body_height == 0:
+            ax.plot([d - bar_width / 2, d + bar_width / 2], [o, o],
+                    color=color, linewidth=1.0)
+        else:
+            rect = Rectangle(
+                (d - bar_width / 2, body_bottom),
+                bar_width, body_height,
+                facecolor=color, edgecolor=color, linewidth=0.5
+            )
+            ax.add_patch(rect)
+
+    ax.xaxis_date()
+
+# ─────────────────── 패널 그리기 ─────────────────── #
+def _plot_panel(ax_candle, ax_ind, df, title, date_fmt):
+    dates_dt  = pd.to_datetime(df['Date'])
+    dates_num = mdates.date2num(dates_dt)
+    close     = df['Close'].astype(float)
+
+    # 캔들 + 이평선
+    draw_candlestick(ax_candle, df)
+    ma5  = close.rolling(5,  min_periods=1).mean()
+    ma20 = close.rolling(20, min_periods=1).mean()
+    ax_candle.plot(dates_num, ma5,  color='#FF8C00', linewidth=0.8, label='MA5')
+    ax_candle.plot(dates_num, ma20, color='#1E90FF', linewidth=0.8,
+                   linestyle='--', label='MA20')
+
+    ax_candle.set_title(title, fontproperties=font_prop, fontsize=10, fontweight='bold')
+    ax_candle.legend(prop=font_prop, fontsize=7, loc='upper left')
+    ax_candle.tick_params(axis='both', labelsize=7)
+    ax_candle.grid(True, alpha=0.25)
+    ax_candle.set_xlim(dates_num[0] - 1, dates_num[-1] + 1)
+
+    # MACD+Stochastic 지표
+    ax_ind.plot(dates_num, df['CompK'].values, color=COLOR_K, linewidth=1.0,
+                label='MACD+Slow%K')
+    ax_ind.plot(dates_num, df['CompD'].values, color=COLOR_D, linewidth=1.0,
+                label='MACD+Slow%D')
+    ax_ind.axhline(OS_LINE, color='gray', linestyle='--', linewidth=0.5)
+    ax_ind.axhline(OB_LINE, color='gray', linestyle='--', linewidth=0.5)
+    ax_ind.fill_between(dates_num, 0,       OS_LINE, alpha=0.06, color='blue')
+    ax_ind.fill_between(dates_num, OB_LINE, 100,     alpha=0.06, color='red')
+    ax_ind.set_ylim(0, 100)
+    ax_ind.set_ylabel('MACD+Stoch', fontsize=7)
+    ax_ind.legend(prop=font_prop, fontsize=6, loc='upper left')
+    ax_ind.tick_params(axis='both', labelsize=7)
+    ax_ind.grid(True, alpha=0.25)
+    ax_ind.set_xlim(dates_num[0] - 1, dates_num[-1] + 1)
+    ax_ind.xaxis.set_major_formatter(DateFormatter(date_fmt))
+
+    last_k = df['CompK'].iloc[-1]
+    last_d = df['CompD'].iloc[-1]
+    ax_ind.annotate(f'{last_k:.1f}', xy=(dates_num[-1], last_k),
+                    fontsize=7, color=COLOR_K, fontweight='bold',
+                    xytext=(5, 3), textcoords='offset points')
+    ax_ind.annotate(f'{last_d:.1f}', xy=(dates_num[-1], last_d),
+                    fontsize=7, color=COLOR_D, fontweight='bold',
+                    xytext=(5, -10), textcoords='offset points')
+
+# ─────────────────── Chart (1×4 세로) ─────────────────── #
+def make_chart(daily_full: pd.DataFrame, code: str):
     name = get_name(code)
-    ax1.plot(df['Date'], df['Close'], label='종가')
-    ax1.plot(df['Date'], df['Close'].rolling(20).mean(), linestyle='--', label='MA20')
-    ax1.set_title(f"{code} ({name})", fontproperties=font_prop)
-    ax1.legend(prop=font_prop)
 
-    ax2.plot(df['Date'], df['CompK'], color='red', label='MACD+Slow%K')
-    ax2.plot(df['Date'], df['CompD'], color='purple', label='MACD+Slow%D')
-    ax2.axhline(20, color='gray', linestyle='--', linewidth=0.5)
-    ax2.axhline(80, color='gray', linestyle='--', linewidth=0.5)
-    ax2.set_ylim(0, 100)
-    ax2.set_title('MACD+Stochastic (NH Style)', fontproperties=font_prop)
-    ax2.legend(prop=font_prop)
-    ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))
+    # 일봉: 전체로 지표 계산 → 최근 80일만 표시
+    df_daily = add_composites(daily_full.copy())
+    df_daily_show = df_daily.tail(DAILY_BARS).reset_index(drop=True)
+    sig_daily = detect_cross(df_daily)
 
-    fig.autofmt_xdate()
-    fig.tight_layout()
+    # 주봉: 리샘플 → 지표 계산 → 최근 40주만 표시
+    df_weekly_full = resample_weekly(daily_full.copy())
+    df_weekly = add_composites(df_weekly_full.copy())
+    df_weekly_show = df_weekly.tail(WEEKLY_BARS).reset_index(drop=True)
+    sig_weekly = detect_cross(df_weekly)
+
+    # 1열 × 4행
+    fig, (ax_dc, ax_di, ax_wc, ax_wi) = plt.subplots(
+        nrows=4, ncols=1, figsize=(10, 14),
+        gridspec_kw={'height_ratios': [3, 1, 3, 1], 'hspace': 0.35}
+    )
+
+    d_sig = f"  [{sig_daily}]" if sig_daily else ""
+    w_sig = f"  [{sig_weekly}]" if sig_weekly else ""
+
+    _plot_panel(ax_dc, ax_di, df_daily_show,
+                title=f"일봉 {DAILY_BARS}일 — {code} ({name}){d_sig}",
+                date_fmt='%m/%d')
+
+    _plot_panel(ax_wc, ax_wi, df_weekly_show,
+                title=f"주봉 {WEEKLY_BARS}주 — {code} ({name}){w_sig}",
+                date_fmt='%y/%m')
+
+    fig.suptitle(
+        f"MACD+Stochastic  단기{FAST_PERIOD}/장기{SLOW_PERIOD}/"
+        f"K1={K_WINDOW}/K2={K_SMOOTH}/D={D_SMOOTH}  "
+        f"기준선 {OS_LINE}/{OB_LINE}",
+        fontproperties=font_prop, fontsize=9, y=1.0, color='gray'
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+
     path = f"{code}_chart.png"
-    fig.savefig(path, dpi=110)
+    fig.savefig(path, dpi=130, bbox_inches='tight')
     plt.close(fig)
-    return path
+    logging.info("차트 저장: %s", path)
+    return path, sig_daily, sig_weekly
 
 # ─────────────────── 텔레그램 ─────────────────── #
-
 def tg_text(msg: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    for chunk in [msg[i:i+3500] for i in range(0, len(msg), 3500)]:
+    for chunk in [msg[i:i + 3500] for i in range(0, len(msg), 3500)]:
         try:
             requests.post(url, json={'chat_id': CHAT_ID, 'text': chunk}, timeout=15)
         except Exception as e:
@@ -284,13 +394,13 @@ def tg_photo(path: str, caption: str = ''):
     url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
     try:
         with open(path, 'rb') as f:
-            requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption}, files={'photo': f}, timeout=30)
+            requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption},
+                          files={'photo': f}, timeout=30)
     except Exception as e:
         logging.warning("사진 전송 실패: %s", e)
     time.sleep(0.3)
 
 # ─────────────────── 메인 ─────────────────── #
-
 def main():
     logging.info("==== 시작: %s ====", dt.datetime.now(KST))
 
@@ -312,7 +422,6 @@ def main():
         rcept_no  = item.get('rcept_no', '')
         report_nm = item.get('report_nm', '')
 
-        # stock_code 찾기
         stock_code = None
         for scode, info in corp_map.items():
             if info['corp_code'] == corp_code:
@@ -330,26 +439,31 @@ def main():
             logging.warning("%s 데이터 부족", code)
             continue
 
-        df = add_composites(df)
-        sig = detect_cross(df)
+        chart_path, sig_daily, sig_weekly = make_chart(df, code)
 
-        caption = (f"{corp_name} ({code})\n"
-                   f"📄 {report_nm}\n"
-                   f"📅 {rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}\n"
-                   f"🔗 DART: https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}")
-        if sig:
-            caption = f"[{sig}]\n" + caption
-            alerts.append(f"{sig} - {corp_name} ({code})")
+        caption = (
+            f"{corp_name} ({code})\n"
+            f"📄 {report_nm}\n"
+            f"📅 {rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}\n"
+            f"🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}\n"
+            f"일봉: {sig_daily if sig_daily else '없음'} | "
+            f"주봉: {sig_weekly if sig_weekly else '없음'}"
+        )
 
-        img = make_chart(df.tail(120), code)
-        tg_photo(img, caption=caption)
+        if sig_daily or sig_weekly:
+            sig_label = f"[일봉:{sig_daily or '-'}/주봉:{sig_weekly or '-'}]"
+            caption = f"{sig_label}\n{caption}"
+            alerts.append(f"• {corp_name} ({code}) — 일봉: {sig_daily or '-'} / 주봉: {sig_weekly or '-'}")
+
+        tg_photo(chart_path, caption=caption)
         if SAVE_CSV:
             df.to_csv(f"{code}_hist.csv", index=False)
 
     if alerts:
-        tg_text("\n".join(alerts))
+        summary = f"📈 신호 종목 ({len(alerts)}개)\n\n" + "\n".join(alerts)
+        tg_text(summary)
     else:
-        tg_text("신호 없음 (골든/데드 크로스 미발생)")
+        tg_text("📭 신호 없음 (골든/데드 크로스 미발생)")
 
     logging.info("==== 종료 ====")
 
